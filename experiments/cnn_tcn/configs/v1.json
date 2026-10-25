@@ -1,0 +1,47 @@
+{
+  "variant": "v1",
+  "seed": 2027,
+  "sample_rate_hz": 50.0,
+  "window_frames": 400,
+  "hop_frames": 50,
+  "normalizer_chunk_frames": 4096,
+  "radar_order": ["29171", "29444", "30722"],
+  "model": {
+    "range_channels": [16, 32, 64],
+    "range_kernels": [7, 5, 3],
+    "range_strides": [2, 2, 1],
+    "features_per_radar": 64,
+    "tcn_hidden": 128,
+    "tcn_kernel": 3,
+    "tcn_dilations": [1, 2, 4, 8],
+    "dropout": 0.1
+  },
+  "loss": {
+    "fall_weight": 1.0,
+    "start_weight": 0.0,
+    "end_weight": 0.0,
+    "fall_positive_weight": 4.0,
+    "boundary_positive_weight": 8.0,
+    "boundary_sigma_s": 0.5,
+    "ignore_margin_s": 2.0,
+    "ignore_flagged": true
+  },
+  "training": {
+    "batch_size": 8,
+    "epochs": 30,
+    "learning_rate": 0.0003,
+    "weight_decay": 0.0001,
+    "num_workers": 4,
+    "grad_clip_norm": 1.0,
+    "amp": true,
+    "device": "auto",
+    "deterministic": true
+  },
+  "decoder": {
+    "fall_threshold": 0.5,
+    "boundary_threshold": 0.5,
+    "merge_gap_s": 0.8,
+    "min_duration_s": 0.6,
+    "boundary_search_radius_s": 1.0
+  }
+}

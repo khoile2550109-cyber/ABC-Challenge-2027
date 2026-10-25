@@ -2,6 +2,12 @@
 
 > **Trạng thái:** tài liệu thiết kế, chưa thực thi và chưa kiểm chứng. CNN–TCN V1/V2 là đề xuất của nhóm, không phải baseline chính thức. Chỉ điền kết quả sau thí nghiệm hợp lệ.
 
+## Implementation để bàn giao
+
+Mã nguồn riêng của nhóm nằm trong [experiments/cnn_tcn/README.md](experiments/cnn_tcn/README.md), gồm loader HDF5 theo lát, model/loss V1–V2, vòng lặp train/resume, inference offline, decoder, hai config và test source. Baseline chính thức và evaluator không bị sửa.
+
+Các config trong [v1.json](experiments/cnn_tcn/configs/v1.json) và [v2.json](experiments/cnn_tcn/configs/v2.json) là giá trị khởi đầu, chưa tối ưu. Có test source để người chủ trì chạy sau. Trạng thái: đã rà soát tĩnh; chưa thực thi, chưa xác nhận chạy thành công; V1/V2 chưa có kết quả.
+
 ## 1. Mục tiêu và phạm vi
 
 Bài toán là phát hiện và định vị sự kiện ngã trong stream UWB liên tục, chưa chia đoạn. Thử nghiệm đề xuất giữ dự đoán theo frame để định vị thời gian; phép so sánh chính là V1 (fall head) với V2 (fall head cộng hai boundary head).
@@ -150,3 +156,4 @@ Sau thí nghiệm cần trả lời: V1 có cải thiện mean event F1 so với
 1. README gói phát hành ABC2027 UWB: cấu trúc stream, nhãn, submission, metric, luật ignore và baseline công bố.
 2. Ishikawa et al., [Alleviating Over-segmentation Errors by Detecting Action Boundaries (ASRF)](https://arxiv.org/abs/2007.06866). Tham khảo ý tưởng chia sẻ đặc trưng cho phân loại frame và dự đoán biên; CNN–TCN đề xuất không phải tái hiện ASRF.
 3. Abu Farha & Gall, [MS-TCN: Multi-Stage Temporal Convolutional Network for Action Segmentation](https://arxiv.org/abs/1903.01945). Tham khảo temporal convolution cho phân đoạn thời gian; tài liệu này không tuyên bố tái hiện cấu hình hay kết quả bài báo.
+
