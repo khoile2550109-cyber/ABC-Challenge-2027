@@ -1,3 +1,16 @@
+# %% [markdown]
+# CELL 0 - ABC2027 UWB FALL DETECTION PIPELINE
+#
+# Quy trình gồm:
+# 1. Zoom-in EDA và trực quan hóa raw/filtered signal.
+# 2. Chebychev filtering, sliding windows và gán nhãn theo streams_events.csv.
+# 3. Huấn luyện ResNet-18 với train/validation monitoring.
+# 4. Inference, HMM-Viterbi và NMS.
+# 5. Official metric, tuning hậu xử lý và xuất kết quả.
+#
+# Có thể chạy từng cell trong Kaggle Notebook hoặc dùng các hàm
+# run_notebook_* ở cuối file.
+
 """ABC2027 UWB fall detection pipeline.
 
 The pipeline is intentionally command based:
@@ -33,6 +46,10 @@ from torch.utils.data import DataLoader, Dataset
 from torchvision.models import ResNet18_Weights, resnet18
 
 
+# %% [markdown]
+# CELL 1 - PATHS, CONSTANTS AND REPRODUCIBILITY
+
+# %%
 # ---------------------------------------------------------------------------
 # Paths and constants
 # ---------------------------------------------------------------------------
@@ -41,6 +58,7 @@ KAGGLE_DATASET_ROOT = Path(
 )
 KAGGLE_TRAIN_STREAMS_DIR = KAGGLE_DATASET_ROOT / "streams" / "train"
 KAGGLE_VAL_STREAMS_DIR = KAGGLE_DATASET_ROOT / "streams" / "val"
+KAGGLE_TEST_STREAMS_DIR = KAGGLE_DATASET_ROOT / "streams" / "test"
 KAGGLE_SEGMENTS_DIR = KAGGLE_DATASET_ROOT / "segments"
 KAGGLE_EVENTS_PATH = KAGGLE_DATASET_ROOT / "streams_events.csv"
 KAGGLE_COMPOSITION_PATH = KAGGLE_DATASET_ROOT / "streams_composition.csv"
@@ -49,6 +67,7 @@ KAGGLE_OUTPUT_DIR = Path("/kaggle/working")
 KAGGLE_CHECKPOINT_DIR = KAGGLE_OUTPUT_DIR / "checkpoints"
 KAGGLE_SUBMISSION_PATH = KAGGLE_OUTPUT_DIR / "submission.csv"
 KAGGLE_ZOOM_DIR = KAGGLE_OUTPUT_DIR / "eda_zoom"
+KAGGLE_PLOT_DIR = KAGGLE_OUTPUT_DIR / "plots"
 
 RATE_HZ = 50.0
 WINDOW_FRAMES = 200
@@ -70,9 +89,14 @@ def seed_everything(seed: int = SEED) -> None:
 
 def stream_path(stream_id: str) -> Path:
     parts = stream_id.split("_")
-    if len(parts) != 2 or parts[0] not in {"train", "val"} or not parts[1].isdigit():
-        raise ValueError(f"Invalid stream id: {stream_id!r}; expected train_00 or val_00")
-    folder = KAGGLE_TRAIN_STREAMS_DIR if parts[0] == "train" else KAGGLE_VAL_STREAMS_DIR
+    if len(parts) != 2 or parts[0] not in {"train", "val", "test"} or not parts[1].isdigit():
+        raise ValueError(f"Invalid stream id: {stream_id!r}; expected train_00, val_00 or test_00")
+    folders = {
+        "train": KAGGLE_TRAIN_STREAMS_DIR,
+        "val": KAGGLE_VAL_STREAMS_DIR,
+        "test": KAGGLE_TEST_STREAMS_DIR,
+    }
+    folder = folders[parts[0]]
     path = folder / f"stream_{int(parts[1]):02d}.h5"
     if not path.is_file():
         raise FileNotFoundError(f"Stream not found: {path}")
@@ -85,13 +109,29 @@ def stream_id_from_path(path: Path) -> str:
 
 
 def list_stream_ids(split: str) -> list[str]:
-    folder = KAGGLE_TRAIN_STREAMS_DIR if split == "train" else KAGGLE_VAL_STREAMS_DIR
+    folders = {
+        "train": KAGGLE_TRAIN_STREAMS_DIR,
+        "val": KAGGLE_VAL_STREAMS_DIR,
+        "test": KAGGLE_TEST_STREAMS_DIR,
+    }
+    if split not in folders:
+        raise ValueError(f"Unsupported split: {split!r}")
+    folder = folders[split]
     paths = sorted(folder.glob("stream_*.h5"))
     if not paths:
+        if split == "test":
+            raise FileNotFoundError(
+                f"No test streams found in {folder}. "
+                "The published ABC2027 package does not include official test streams."
+            )
         raise FileNotFoundError(f"No HDF5 streams found in {folder}")
     return [stream_id_from_path(path) for path in paths]
 
 
+# %% [markdown]
+# CELL 2 - DATASET LOADING AND EVENT LABELS
+
+# %%
 # ---------------------------------------------------------------------------
 # Dataset loading and labels
 # ---------------------------------------------------------------------------
@@ -142,6 +182,10 @@ def event_intervals(
     return intervals
 
 
+# %% [markdown]
+# CELL 3 - ZOOM-IN EDA AND PREPROCESSING
+
+# %%
 # ---------------------------------------------------------------------------
 # EDA and preprocessing
 # ---------------------------------------------------------------------------
@@ -304,6 +348,10 @@ def make_training_windows(stream_ids: Iterable[str]) -> list[tuple[str, int, int
     return all_windows
 
 
+# %% [markdown]
+# CELL 4 - WINDOW DATASET AND RESNET-18 BACKBONE
+
+# %%
 # ---------------------------------------------------------------------------
 # Backbone, training and prediction
 # ---------------------------------------------------------------------------
@@ -318,6 +366,28 @@ class ResNet18Backbone(nn.Module):
         return self.model(inputs)
 
 
+def evaluate_window_model(
+    model: nn.Module,
+    loader: DataLoader,
+    device: torch.device,
+    criterion: nn.Module,
+) -> tuple[float, float]:
+    model.eval()
+    total_loss = 0.0
+    correct = 0
+    count = 0
+    with torch.no_grad():
+        for inputs, labels in loader:
+            inputs, labels = inputs.to(device), labels.to(device)
+            outputs = model(inputs)
+            total_loss += criterion(outputs, labels).item() * len(labels)
+            correct += int((outputs.argmax(dim=1) == labels).sum())
+            count += len(labels)
+    if count == 0:
+        raise ValueError("Validation loader is empty")
+    return total_loss / count, correct / count
+
+
 def train_model(
     epochs: int = 5,
     batch_size: int = 32,
@@ -326,17 +396,36 @@ def train_model(
 ) -> Path:
     seed_everything()
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    windows = make_training_windows(list_stream_ids("train"))
-    loader = DataLoader(StreamWindowDataset(windows), batch_size=batch_size, shuffle=False)
+    train_windows = make_training_windows(list_stream_ids("train"))
+    val_windows = make_training_windows(list_stream_ids("val"))
+    train_loader = DataLoader(
+        StreamWindowDataset(train_windows),
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=0,
+    )
+    val_loader = DataLoader(
+        StreamWindowDataset(val_windows),
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=0,
+    )
     model = ResNet18Backbone().to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate)
     criterion = nn.CrossEntropyLoss()
+    history = {
+        "train_loss": [],
+        "train_accuracy": [],
+        "val_loss": [],
+        "val_accuracy": [],
+    }
+    best_val_loss = float("inf")
     for epoch in range(epochs):
         model.train()
         total_loss = 0.0
         correct = 0
         count = 0
-        for inputs, labels in loader:
+        for inputs, labels in train_loader:
             inputs, labels = inputs.to(device), labels.to(device)
             optimizer.zero_grad(set_to_none=True)
             outputs = model(inputs)
@@ -346,14 +435,66 @@ def train_model(
             total_loss += loss.item() * len(labels)
             correct += int((outputs.argmax(dim=1) == labels).sum())
             count += len(labels)
+        train_loss = total_loss / count
+        train_accuracy = correct / count
+        val_loss, val_accuracy = evaluate_window_model(
+            model, val_loader, device, criterion
+        )
+        history["train_loss"].append(train_loss)
+        history["train_accuracy"].append(train_accuracy)
+        history["val_loss"].append(val_loss)
+        history["val_accuracy"].append(val_accuracy)
         print(
             f"[TRAIN] epoch={epoch + 1}/{epochs} "
-            f"loss={total_loss / count:.5f} accuracy={correct / count:.4f}"
+            f"train_loss={train_loss:.5f} train_accuracy={train_accuracy:.4f} "
+            f"val_loss={val_loss:.5f} val_accuracy={val_accuracy:.4f}"
         )
+        if val_loss < best_val_loss:
+            best_val_loss = val_loss
+            checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
+            torch.save(
+                {
+                    "model_state": model.state_dict(),
+                    "rate_hz": RATE_HZ,
+                    "history": history,
+                    "best_val_loss": best_val_loss,
+                },
+                checkpoint_path,
+            )
     checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
-    torch.save({"model_state": model.state_dict(), "rate_hz": RATE_HZ}, checkpoint_path)
+    save_training_plot(history, KAGGLE_PLOT_DIR / "training_history.png")
+    (KAGGLE_OUTPUT_DIR / "training_history.json").write_text(
+        json.dumps(history, indent=2), encoding="utf-8"
+    )
     print(f"[INFO] Saved checkpoint: {checkpoint_path}")
     return checkpoint_path
+
+
+def save_training_plot(history: dict[str, list[float]], output_path: Path) -> Path:
+    """Save loss and accuracy curves from the training run."""
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    epochs = np.arange(1, len(history["train_loss"]) + 1)
+    fig, axes = plt.subplots(1, 2, figsize=(12, 4))
+    axes[0].plot(epochs, history["train_loss"], marker="o", label="train")
+    axes[0].plot(epochs, history["val_loss"], marker="o", label="validation")
+    axes[0].set_title("Loss")
+    axes[0].set_xlabel("Epoch")
+    axes[0].set_ylabel("Cross-entropy")
+    axes[0].grid(True)
+    axes[0].legend()
+    axes[1].plot(epochs, history["train_accuracy"], marker="o", label="train")
+    axes[1].plot(epochs, history["val_accuracy"], marker="o", label="validation")
+    axes[1].set_title("Accuracy")
+    axes[1].set_xlabel("Epoch")
+    axes[1].set_ylabel("Accuracy")
+    axes[1].set_ylim(0.0, 1.0)
+    axes[1].grid(True)
+    axes[1].legend()
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=160)
+    plt.close(fig)
+    print(f"[INFO] Saved training plot: {output_path}")
+    return output_path
 
 
 def load_model(checkpoint_path: Path, device: torch.device) -> nn.Module:
@@ -370,10 +511,15 @@ def model_scores(
     batch_size: int = 64,
 ) -> tuple[list[tuple[float, float]], np.ndarray]:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    cir = chebychev_filter(load_stream(stream_id))
-    bounds = window_bounds(cir.shape[1])
-    windows = [cir[:, first:last, :] for first, last in bounds]
-    loader = DataLoader(WindowDataset([(window, 0) for window in windows]), batch_size=batch_size)
+    frame_count = load_stream(stream_id).shape[1]
+    bounds = window_bounds(frame_count)
+    records = [(stream_id, first, last, 0) for first, last in bounds]
+    loader = DataLoader(
+        StreamWindowDataset(records),
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=0,
+    )
     model = load_model(checkpoint_path, device)
     scores: list[float] = []
     with torch.no_grad():
@@ -383,6 +529,10 @@ def model_scores(
     return [(first / RATE_HZ, last / RATE_HZ) for first, last in bounds], np.asarray(scores)
 
 
+# %% [markdown]
+# CELL 5 - HMM-VITERBI, EVENT EXTRACTION AND NMS
+
+# %%
 # ---------------------------------------------------------------------------
 # HMM and event post-processing
 # ---------------------------------------------------------------------------
@@ -421,6 +571,7 @@ def states_to_events(
     states: np.ndarray,
     scores: np.ndarray,
     min_duration: float = 0.8,
+    nms_iou_threshold: float = 0.3,
 ) -> list[dict]:
     active = np.isin(states, [1, 2])
     indices = np.flatnonzero(active)
@@ -439,7 +590,7 @@ def states_to_events(
             result.append(
                 {"t_start": start, "t_end": end, "score": float(np.max(scores[first:last + 1]))}
             )
-    return non_maximum_suppression(result)
+    return non_maximum_suppression(result, nms_iou_threshold)
 
 
 def non_maximum_suppression(events: list[dict], iou_threshold: float = 0.3) -> list[dict]:
@@ -454,16 +605,81 @@ def non_maximum_suppression(events: list[dict], iou_threshold: float = 0.3) -> l
     return sorted(kept, key=lambda item: item["t_start"])
 
 
+def save_prediction_diagnostic(
+    stream_id: str,
+    bounds: list[tuple[float, float]],
+    scores: np.ndarray,
+    output_dir: Path = KAGGLE_PLOT_DIR,
+) -> Path:
+    """Plot window scores and labelled intervals for train/validation streams."""
+    events = load_events().get(stream_id, [])
+    output_dir.mkdir(parents=True, exist_ok=True)
+    output_path = output_dir / f"{stream_id}_prediction_diagnostics.png"
+    centers = np.asarray([(start + end) / 2.0 for start, end in bounds])
+    labels = window_labels(
+        [(int(start * RATE_HZ), int(end * RATE_HZ)) for start, end in bounds],
+        event_intervals(events),
+    )
+    predicted = scores >= 0.5
+    false_positive = (predicted == 1) & (labels == 0)
+    false_negative = (predicted == 0) & (labels == 1)
+    fig, axis = plt.subplots(figsize=(16, 4))
+    axis.plot(centers, scores, linewidth=0.8, label="P(fall)")
+    axis.axhline(0.5, color="black", linestyle="--", linewidth=0.8, label="0.5")
+    axis.scatter(
+        centers[false_positive],
+        scores[false_positive],
+        color="red",
+        s=12,
+        label="false positive window",
+    )
+    axis.scatter(
+        centers[false_negative],
+        scores[false_negative],
+        color="purple",
+        s=12,
+        label="false negative window",
+    )
+    for event in events:
+        if not event["ignore"]:
+            axis.axvspan(event["t_start"], event["t_end"], color="green", alpha=0.2)
+    axis.set_title(f"{stream_id}: window fall probabilities and ground truth")
+    axis.set_xlabel("Time (s)")
+    axis.set_ylabel("P(fall)")
+    axis.set_ylim(0.0, 1.0)
+    axis.grid(True, alpha=0.25)
+    axis.legend(loc="upper right")
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=160)
+    plt.close(fig)
+    print(
+        f"[INFO] {stream_id}: false_positive_windows={int(false_positive.sum())}, "
+        f"false_negative_windows={int(false_negative.sum())}"
+    )
+    return output_path
+
+
 def predict_split(
     split: str,
     checkpoint_path: Path,
     output_path: Path = KAGGLE_SUBMISSION_PATH,
+    min_duration: float = 0.8,
+    nms_iou_threshold: float = 0.3,
 ) -> Path:
     predictions = []
     for stream_id in list_stream_ids(split):
         bounds, scores = model_scores(stream_id, checkpoint_path)
+        if split != "test":
+            diagnostic_path = save_prediction_diagnostic(stream_id, bounds, scores)
+            print(f"[INFO] Saved prediction diagnostic: {diagnostic_path}")
         states = ViterbiDecoder().decode(scores)
-        for event in states_to_events(bounds, states, scores):
+        for event in states_to_events(
+            bounds,
+            states,
+            scores,
+            min_duration=min_duration,
+            nms_iou_threshold=nms_iou_threshold,
+        ):
             predictions.append({"stream_id": stream_id, **event, "t_alarm": event["t_start"]})
     output_path.parent.mkdir(parents=True, exist_ok=True)
     with output_path.open("w", encoding="utf-8", newline="") as handle:
@@ -476,6 +692,71 @@ def predict_split(
     return output_path
 
 
+def tune_postprocessing(
+    checkpoint_path: Path,
+    split: str = "val",
+    min_durations: tuple[float, ...] = (0.6, 0.8, 1.0, 1.2),
+    nms_thresholds: tuple[float, ...] = (0.2, 0.3, 0.5),
+) -> dict:
+    """Select post-processing parameters by official validation ranking score."""
+    if split != "val":
+        raise ValueError("Tuning must use the validation split, not train or test")
+    cached_scores = {
+        stream_id: model_scores(stream_id, checkpoint_path)
+        for stream_id in list_stream_ids(split)
+    }
+    best: dict | None = None
+    for min_duration in min_durations:
+        for nms_threshold in nms_thresholds:
+            candidate_path = KAGGLE_OUTPUT_DIR / "tuning_candidate.csv"
+            with candidate_path.open("w", encoding="utf-8", newline="") as handle:
+                writer = csv.DictWriter(
+                    handle,
+                    fieldnames=["stream_id", "t_start", "t_end", "score", "t_alarm"],
+                )
+                writer.writeheader()
+                for stream_id, (bounds, scores) in cached_scores.items():
+                    states = ViterbiDecoder().decode(scores)
+                    for event in states_to_events(
+                        bounds,
+                        states,
+                        scores,
+                        min_duration=min_duration,
+                        nms_iou_threshold=nms_threshold,
+                    ):
+                        writer.writerow(
+                            {
+                                "stream_id": stream_id,
+                                **event,
+                                "t_alarm": event["t_start"],
+                            }
+                        )
+            report = score_predictions(candidate_path, split="val", ignore_flagged=True)
+            ranking = report["ranking_score"]["f1_mean"]
+            if best is None or ranking > best["ranking_score"]:
+                best = {
+                    "min_duration": min_duration,
+                    "nms_iou_threshold": nms_threshold,
+                    "ranking_score": ranking,
+                    "report": report,
+                }
+    if best is None:
+        raise RuntimeError("No tuning candidates were evaluated")
+    (KAGGLE_OUTPUT_DIR / "tuning_report.json").write_text(
+        json.dumps(best, indent=2), encoding="utf-8"
+    )
+    print(
+        f"[TUNE] min_duration={best['min_duration']} "
+        f"nms_iou_threshold={best['nms_iou_threshold']} "
+        f"f1_mean={best['ranking_score']:.4f}"
+    )
+    return best
+
+
+# %% [markdown]
+# CELL 6 - OFFICIAL METRICS, TUNING AND NOTEBOOK RUNNERS
+
+# %%
 # ---------------------------------------------------------------------------
 # Official-style event metric
 # ---------------------------------------------------------------------------
@@ -484,54 +765,27 @@ def score_predictions(
     split: str = "val",
     ignore_flagged: bool = False,
 ) -> dict:
-    events_by_stream = load_events()
-    ground_truth = {
-        stream_id: event_intervals(events_by_stream.get(stream_id, []), ignore_flagged=ignore_flagged)
-        for stream_id in list_stream_ids(split)
-    }
-    predictions: dict[str, list[dict]] = {stream_id: [] for stream_id in ground_truth}
-    with prediction_path.open(encoding="utf-8", newline="") as handle:
-        for row in csv.DictReader(handle):
-            if row["stream_id"] in predictions:
-                predictions[row["stream_id"]].append(
-                    {
-                        "t_start": float(row["t_start"]),
-                        "t_end": float(row["t_end"]),
-                        "score": float(row["score"]),
-                    }
-                )
-    report = {}
-    for theta in (0.1, 0.3, 0.5, 0.7):
-        true_positive = false_positive = false_negative = 0
-        ious = []
-        for stream_id, truth in ground_truth.items():
-            used: set[int] = set()
-            for prediction in sorted(predictions[stream_id], key=lambda item: item["score"], reverse=True):
-                matches = [
-                    (index, temporal_iou(prediction["t_start"], prediction["t_end"], start, end))
-                    for index, (start, end) in enumerate(truth)
-                    if index not in used
-                ]
-                best = max(matches, key=lambda item: item[1], default=(-1, 0.0))
-                if best[1] >= theta:
-                    used.add(best[0])
-                    true_positive += 1
-                    ious.append(best[1])
-                else:
-                    false_positive += 1
-            false_negative += len(truth) - len(used)
-        precision = true_positive / max(true_positive + false_positive, 1)
-        recall = true_positive / max(true_positive + false_negative, 1)
-        report[str(theta)] = {
-            "precision": precision,
-            "recall": recall,
-            "f1": 2 * precision * recall / max(precision + recall, 1e-12),
-            "mean_tiou": float(np.mean(ious)) if ious else 0.0,
-            "true_positive": true_positive,
-            "false_positive": false_positive,
-            "false_negative": false_negative,
-        }
-    return report
+    evaluator_src = KAGGLE_DATASET_ROOT / "src"
+    if not evaluator_src.is_dir():
+        raise FileNotFoundError(f"Official evaluator package not found: {evaluator_src}")
+    if str(evaluator_src) not in sys.path:
+        sys.path.insert(0, str(evaluator_src))
+    from abc2027.evaluate import (
+        evaluate,
+        load_ground_truth,
+        stream_durations,
+        validate_predictions,
+    )
+
+    streams_dir = (
+        KAGGLE_TRAIN_STREAMS_DIR if split == "train" else KAGGLE_VAL_STREAMS_DIR
+    )
+    durations = stream_durations(streams_dir)
+    if not durations:
+        raise FileNotFoundError(f"No streams found for split {split!r}: {streams_dir}")
+    predictions = validate_predictions(prediction_path, durations)
+    ground_truth = load_ground_truth(KAGGLE_EVENTS_PATH, ignore_flagged=ignore_flagged)
+    return evaluate(ground_truth, predictions, durations)
 
 
 def run_notebook_zoom(
@@ -539,7 +793,7 @@ def run_notebook_zoom(
     event_index: int = 0,
     margin_seconds: float = 5.0,
 ) -> Path:
-    """Run the close-up EDA step directly from a Kaggle notebook cell."""
+    """Run zoom EDA directly from a Kaggle Notebook cell."""
     return perform_zoom_eda(stream_id, event_index, margin_seconds)
 
 
@@ -548,7 +802,7 @@ def run_notebook_train(
     batch_size: int = 32,
     learning_rate: float = 1e-4,
 ) -> Path:
-    """Train the model directly from a Kaggle notebook cell."""
+    """Train and save the ResNet-18 checkpoint from a Kaggle Notebook cell."""
     return train_model(
         epochs=epochs,
         batch_size=batch_size,
@@ -561,8 +815,61 @@ def run_notebook_predict(
     checkpoint_path: str | Path = KAGGLE_CHECKPOINT_DIR / "resnet18_abc2027.pt",
     split: str = "val",
 ) -> Path:
-    """Create predictions directly from a Kaggle notebook cell."""
+    """Generate a submission directly from a Kaggle Notebook cell."""
     return predict_split(split, Path(checkpoint_path), KAGGLE_SUBMISSION_PATH)
+
+
+def run_notebook_all(
+    epochs: int = 5,
+    batch_size: int = 32,
+    learning_rate: float = 1e-4,
+) -> dict[str, Path]:
+    """Run EDA-ready training, tuning, prediction and validation evaluation."""
+    outputs: dict[str, Path] = {}
+    outputs["zoom_eda"] = run_notebook_zoom(
+        stream_id="train_00",
+        event_index=0,
+        margin_seconds=5.0,
+    )
+    checkpoint_path = run_notebook_train(epochs, batch_size, learning_rate)
+    tuning = tune_postprocessing(checkpoint_path)
+    best_duration = tuning["min_duration"]
+    best_nms = tuning["nms_iou_threshold"]
+    outputs["checkpoint"] = checkpoint_path
+    outputs["train_submission"] = predict_split(
+        "train",
+        checkpoint_path,
+        KAGGLE_OUTPUT_DIR / "train_submission.csv",
+        min_duration=best_duration,
+        nms_iou_threshold=best_nms,
+    )
+    outputs["val_submission"] = predict_split(
+        "val",
+        checkpoint_path,
+        KAGGLE_OUTPUT_DIR / "val_submission.csv",
+        min_duration=best_duration,
+        nms_iou_threshold=best_nms,
+    )
+    val_report = score_predictions(
+        KAGGLE_OUTPUT_DIR / "val_submission.csv",
+        split="val",
+        ignore_flagged=True,
+    )
+    (KAGGLE_OUTPUT_DIR / "val_report.json").write_text(
+        json.dumps(val_report, indent=2), encoding="utf-8"
+    )
+    print(json.dumps(val_report, indent=2))
+    try:
+        outputs["test_submission"] = predict_split(
+            "test",
+            checkpoint_path,
+            KAGGLE_OUTPUT_DIR / "test_submission.csv",
+            min_duration=best_duration,
+            nms_iou_threshold=best_nms,
+        )
+    except FileNotFoundError as error:
+        print(f"[INFO] Test prediction skipped: {error}")
+    return outputs
 
 
 def run_notebook_evaluate(
@@ -570,10 +877,32 @@ def run_notebook_evaluate(
     split: str = "val",
     ignore_flagged: bool = True,
 ) -> dict:
-    """Evaluate predictions directly from a Kaggle notebook cell."""
+    """Evaluate predictions directly from a Kaggle Notebook cell."""
     report = score_predictions(Path(prediction_path), split, ignore_flagged)
     print(json.dumps(report, indent=2))
     return report
+
+
+# %% [markdown]
+# CELL 7 - RUN THE COMPLETE PIPELINE IN KAGGLE
+#
+# Sau khi copy từng cell vào Kaggle, chạy:
+#
+# outputs = run_notebook_all(
+#     epochs=5,
+#     batch_size=32,
+#     learning_rate=1e-4,
+# )
+# display(outputs)
+#
+# Cell này sẽ:
+# - tạo ảnh Zoom-in EDA;
+# - train ResNet-18 với train/validation;
+# - lưu loss/accuracy;
+# - tune min_duration và NMS IoU trên validation;
+# - tạo train_submission.csv và val_submission.csv;
+# - đánh giá validation bằng official evaluator;
+# - dự đoán test nếu thư mục test tồn tại.
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -592,7 +921,7 @@ def main(argv: list[str] | None = None) -> None:
     train.add_argument("--checkpoint-path", type=Path, default=KAGGLE_CHECKPOINT_DIR / "resnet18_abc2027.pt")
 
     predict = subparsers.add_parser("predict", help="Predict events and write submission CSV")
-    predict.add_argument("--split", choices=("train", "val"), default="val")
+    predict.add_argument("--split", choices=("train", "val", "test"), default="val")
     predict.add_argument("--checkpoint-path", type=Path, required=True)
     predict.add_argument("--output-path", type=Path, default=KAGGLE_SUBMISSION_PATH)
 
